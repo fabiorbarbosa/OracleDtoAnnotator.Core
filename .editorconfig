@@ -1,0 +1,52 @@
+# top-most EditorConfig file
+root = true
+
+# All files
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+
+# C# files
+[*.cs]
+# Use 4 spaces for indentation
+indent_style = space
+indent_size = 4
+
+# C# code style rules
+dotnet_sort_system_directives_first = true
+dotnet_separate_import_directive_groups = true
+
+# Require expression-bodied members when possible
+csharp_style_expression_bodied_methods = when_possible:suggestion
+csharp_style_expression_bodied_properties = when_possible:suggestion
+csharp_style_expression_bodied_ctors = when_possible:suggestion
+
+# Require braces for all control blocks
+csharp_prefer_braces = true:warning
+
+# Prefer using 'nameof'
+csharp_style_prefer_nameof_expression = true:suggestion
+
+# Prefer pattern matching
+csharp_style_pattern_matching_over_is_with_cast_check = true:suggestion
+csharp_style_pattern_matching_over_as_with_null_check = true:suggestion
+
+# Prefer explicit tuple names
+dotnet_style_explicit_tuple_names = true:suggestion
+
+# File encoding for C# files
+[*.{cs,csx}]
+charset = utf-8-bom
+
+# JSON files
+[*.json]
+indent_style = space
+indent_size = 2
+
+# Markdown files
+[*.md]
+trim_trailing_whitespace
