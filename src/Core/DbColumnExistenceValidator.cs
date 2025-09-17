@@ -1,24 +1,28 @@
+// DbColumnExistenceValidator.cs
 using LinqToDB;
 using LinqToDB.Data;
-using LinqToDB.Mapping;
-
 using System.Reflection;
 using System.Text;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 public sealed class DbColumnExistenceValidator
 {
     private readonly DataConnection _ctx;
     private readonly bool _respectQuotedIdentifiers;
+    private readonly bool _useUserTabCols;
 
-    public DbColumnExistenceValidator(DataConnection ctx, bool respectQuotedIdentifiers = false)
+    /// <param name="respectQuotedIdentifiers">true para não fazer ToUpper (caso use nomes com aspas)</param>
+    /// <param name="useUserTabCols">true para consultar USER_TAB_COLS (schema atual) ao invés de ALL_TAB_COLUMNS</param>
+    public DbColumnExistenceValidator(DataConnection ctx, bool respectQuotedIdentifiers = false, bool useUserTabCols = false)
     {
         _ctx = ctx ?? throw new ArgumentNullException(nameof(ctx));
         _respectQuotedIdentifiers = respectQuotedIdentifiers;
+        _useUserTabCols = useUserTabCols;
     }
 
     public sealed record TableCheckResult(
         string EntityName,
-        string? Schema,
+        string Schema,
         string Table,
         IReadOnlyList<string> MissingColumns)
     {
@@ -27,28 +31,30 @@ public sealed class DbColumnExistenceValidator
         {
             var sb = new StringBuilder();
             sb.Append($"[{EntityName}] {Schema}.{Table} => ");
-            if (Ok) sb.Append("✔ OK");
-            else sb.Append("Faltando: " + string.Join(", ", MissingColumns));
+            sb.Append(Ok ? "✔ OK" : "Faltando: " + string.Join(", ", MissingColumns));
             return sb.ToString();
         }
     }
 
     /// <summary>
-    /// Varre todas as propriedades ITable&lt;T&gt; do seu DbContext e valida se cada coluna mapeada existe no Oracle.
+    /// Varre as propriedades ITable&lt;T&gt; do DbContext, extrai os nomes de colunas mapeadas e valida se existem no Oracle.
     /// </summary>
-    /// <param name="tableFilter">Opcional: filtrar entidades/tabelas pelo tipo T (ex.: namespace).</param>
-    public async Task<IReadOnlyList<TableCheckResult>> ValidateAsync(Func<Type, bool>? tableFilter = null, CancellationToken ct = default)
+    /// <param name="tableFilter">Opcional: filtra os tipos T das tabelas (ex.: por namespace)</param>
+    public IReadOnlyList<TableCheckResult> Validate(Func<Type, bool>? tableFilter = null)
     {
         var results = new List<TableCheckResult>();
 
+        // Propriedades públicas ITable<T>
         var tableProps = _ctx.GetType()
             .GetProperties(BindingFlags.Instance | BindingFlags.Public)
             .Where(p => p.PropertyType.IsGenericType &&
                         p.PropertyType.GetGenericTypeDefinition() == typeof(ITable<>))
             .ToList();
 
-        // cache do USER atual
-        string currentUser = await _ctx.ExecuteAsync<string>("SELECT USER FROM DUAL");
+        // Usuário/schema atual
+        string currentUser = _ctx.Execute<string>("SELECT USER FROM DUAL");
+
+        Func<string, string> norm = _respectQuotedIdentifiers ? s => s : s => s.ToUpperInvariant();
 
         foreach (var prop in tableProps)
         {
@@ -58,36 +64,26 @@ public sealed class DbColumnExistenceValidator
 
             var ed = _ctx.MappingSchema.GetEntityDescriptor(entityType);
             if (ed == null || string.IsNullOrWhiteSpace(ed.TableName))
-                continue; // não é uma entity mapeada
+                continue; // não mapeado como tabela
 
-            string owner = (ed.SchemaName ?? currentUser) ?? currentUser;
-            string table = ed.TableName;
+            string owner = norm((ed.SchemaName ?? currentUser) ?? currentUser);
+            string table = norm(ed.TableName);
 
-            // Normalização de nomes
-            Func<string, string> norm = _respectQuotedIdentifiers
-                ? s => s // preserva casing e aspas (assuma que mapping já bate 1:1)
-                : s => s.ToUpperInvariant();
-
-            owner = norm(owner);
-            table = norm(table);
-
-            // colunas mapeadas na entity (somente nome)
+            // Colunas mapeadas na entity
             var mappedCols = ed.Columns
-                .Select(c => c.ColumnName ?? c.MemberName) // ColumnName cobre atributos e fluent mapping
+                .Select(c => c.ColumnName ?? c.MemberName)
                 .Where(n => !string.IsNullOrWhiteSpace(n))
                 .Select(norm)
                 .Distinct()
                 .ToArray();
 
-            // busca colunas no Oracle
-            var dbCols = await _ctx.QueryToListAsync<string>(
-                @"SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER = :owner AND TABLE_NAME = :table",
-                new DataParameter("owner", owner),
-                new DataParameter("table", table));
+            // Colunas existentes no Oracle
+            var dbColSet = GetColumnsFromOracle(owner, table, norm);
 
-            var dbColSet = new HashSet<string>(dbCols.Select(norm), StringComparer.Ordinal);
-
-            var missing = mappedCols.Where(mc => !dbColSet.Contains(mc)).OrderBy(x => x).ToArray();
+            // Diferenças
+            var missing = mappedCols.Where(mc => !dbColSet.Contains(mc))
+                                    .OrderBy(x => x)
+                                    .ToArray();
 
             results.Add(new TableCheckResult(
                 EntityName: entityType.FullName ?? entityType.Name,
@@ -99,38 +95,89 @@ public sealed class DbColumnExistenceValidator
         return results;
     }
 
-    /// <summary>
-    /// Útil para "quebrar" build/pipeline: lança exceção se faltar qualquer coluna.
-    /// </summary>
-    public async Task ThrowIfAnyMissingAsync(Func<Type, bool>? tableFilter = null, CancellationToken ct = default)
+    /// <summary> Lança exceção se houver qualquer coluna faltando — útil para "quebrar" o build/CI. </summary>
+    public void ThrowIfAnyMissing(Func<Type, bool>? tableFilter = null)
     {
-        var res = await ValidateAsync(tableFilter, ct);
+        var res = Validate(tableFilter);
         var offenders = res.Where(r => !r.Ok).ToList();
         if (offenders.Count == 0) return;
 
-        var msg = new StringBuilder("Colunas faltando no banco:\n");
+        var sb = new StringBuilder("Colunas faltando no banco:\n");
         foreach (var r in offenders)
-            msg.AppendLine(" - " + r.ToString());
-        throw new InvalidOperationException(msg.ToString());
+            sb.AppendLine(" - " + r.ToString());
+        throw new InvalidOperationException(sb.ToString());
     }
-}
 
-// helpers LinqToDB bem simples (evita mapear DTO só para uma coluna)
-internal static class Linq2DbTinyHelpers
-{
-    public static async Task<List<T>> QueryToListAsync<T>(this DataConnection dc, string sql, params DataParameter[] ps)
+    // --------- Internals ---------
+
+    private HashSet<string> GetColumnsFromOracle(string owner, string table, Func<string, string> norm)
     {
-        var list = new List<T>();
-        await foreach (var item in dc.QueryAsync<T>(sql, ps))
-            list.Add(item);
-        return list;
+        // Para mapear por nome sem precisar de async/ExecuteReaderAsync
+        var sqlAll = @"SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER = :owner AND TABLE_NAME = :table";
+        var sqlUser = @"SELECT COLUMN_NAME FROM USER_TAB_COLS WHERE TABLE_NAME = :table";
+
+        if (_useUserTabCols)
+        {
+            return _ctx.Query<DbColName>(sqlUser,
+                        new DataParameter("table", table))
+                       .Select(r => norm(r.COLUMN_NAME))
+                       .ToHashSet(StringComparer.Ordinal);
+        }
+        else
+        {
+            return _ctx.Query<DbColName>(sqlAll,
+                        new DataParameter("owner", owner),
+                        new DataParameter("table", table))
+                       .Select(r => norm(r.COLUMN_NAME))
+                       .ToHashSet(StringComparer.Ordinal);
+        }
+    }
+
+    private sealed class DbColName
+    {
+        // Nome igual ao do SELECT para LinqToDB mapear por convenção
+        public string COLUMN_NAME { get; set; } = "";
     }
 }
 
-// await using var ctx = new MyOracleDbContext(); // herda DataConnection
-// var validator = new DbColumnExistenceValidator(ctx /*, respectQuotedIdentifiers:false*/);
+// ------------------ (Opcional) HealthCheck síncrono ------------------
 
-// Opcional: filtrar por namespace/padrão
-// Func<Type,bool> filter = t => t.Namespace?.EndsWith(".Entities") == true;
+public sealed class DbColumnsExistHealthCheck<TCtx> : IHealthCheck where TCtx : DataConnection
+{
+    private readonly TCtx _ctx;
+    private readonly bool _respectQuotedIdentifiers;
+    private readonly bool _useUserTabCols;
+    private readonly Func<Type, bool>? _filter;
 
-// await validator.ThrowIfAnyMissingAsync(/*filter*/);
+    public DbColumnsExistHealthCheck(
+        TCtx ctx,
+        bool respectQuotedIdentifiers = false,
+        bool useUserTabCols = false,
+        Func<Type, bool>? filter = null)
+    {
+        _ctx = ctx;
+        _respectQuotedIdentifiers = respectQuotedIdentifiers;
+        _useUserTabCols = useUserTabCols;
+        _filter = filter;
+    }
+
+    public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken _ = default)
+    {
+        try
+        {
+            var validator = new DbColumnExistenceValidator(_ctx, _respectQuotedIdentifiers, _useUserTabCols);
+            var results = validator.Validate(_filter);
+            var missing = results.Where(r => !r.Ok).ToList();
+
+            if (missing.Count == 0)
+                return Task.FromResult(HealthCheckResult.Healthy("Todas as colunas mapeadas existem no banco."));
+
+            var desc = string.Join("; ", missing.Select(m => m.ToString()));
+            return Task.FromResult(HealthCheckResult.Unhealthy("Colunas faltando: " + desc));
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult(HealthCheckResult.Unhealthy("Falha ao validar colunas.", ex));
+        }
+    }
+}
