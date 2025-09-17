@@ -8,10 +8,10 @@ var validator = new DbColumnExistenceValidator(ctx, respectQuotedIdentifiers: fa
 
 validator.ThrowIfAnyMissing(/*filter*/);
 
+// registra o seu DbContext normalmente
+builder.Services.AddTransient<MyOracleDbContext>();
+
+// registra o healthcheck como classe
 builder.Services.AddHealthChecks()
-    .AddCheck("db-columns-exist",
-        sp => new DbColumnsExistHealthCheck<MyOracleDbContext>(
-            sp.GetRequiredService<MyOracleDbContext>(),
-            respectQuotedIdentifiers: false,
-            useUserTabCols: false,
-            filter: t => t.Namespace?.EndsWith(".Entities") == true));
+    .AddCheck<DbColumnsExistHealthCheck<MyOracleDbContext>>(
+        "db-columns-exist");

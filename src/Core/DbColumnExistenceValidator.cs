@@ -145,39 +145,32 @@ public sealed class DbColumnExistenceValidator
 public sealed class DbColumnsExistHealthCheck<TCtx> : IHealthCheck where TCtx : DataConnection
 {
     private readonly TCtx _ctx;
-    private readonly bool _respectQuotedIdentifiers;
-    private readonly bool _useUserTabCols;
-    private readonly Func<Type, bool>? _filter;
 
-    public DbColumnsExistHealthCheck(
-        TCtx ctx,
-        bool respectQuotedIdentifiers = false,
-        bool useUserTabCols = false,
-        Func<Type, bool>? filter = null)
+    public DbColumnsExistHealthCheck(TCtx ctx) // aqui o DI injeta seu DbContext
     {
         _ctx = ctx;
-        _respectQuotedIdentifiers = respectQuotedIdentifiers;
-        _useUserTabCols = useUserTabCols;
-        _filter = filter;
     }
 
-    public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken _ = default)
+    public Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context, CancellationToken cancellationToken = default)
     {
         try
         {
-            var validator = new DbColumnExistenceValidator(_ctx, _respectQuotedIdentifiers, _useUserTabCols);
-            var results = validator.Validate(_filter);
+            var validator = new DbColumnExistenceValidator(_ctx);
+            var results = validator.Validate();
             var missing = results.Where(r => !r.Ok).ToList();
 
             if (missing.Count == 0)
-                return Task.FromResult(HealthCheckResult.Healthy("Todas as colunas mapeadas existem no banco."));
+                return Task.FromResult(
+                    HealthCheckResult.Healthy("Todas as colunas mapeadas existem no banco."));
 
             var desc = string.Join("; ", missing.Select(m => m.ToString()));
-            return Task.FromResult(HealthCheckResult.Unhealthy("Colunas faltando: " + desc));
+            return Task.FromResult(
+                HealthCheckResult.Unhealthy("Colunas faltando: " + desc));
         }
         catch (Exception ex)
         {
-            return Task.FromResult(HealthCheckResult.Unhealthy("Falha ao validar colunas.", ex));
+            return Task.FromResult(HealthCheckResult.Unhealthy("Erro ao validar colunas.", ex));
         }
     }
 }
